@@ -1,0 +1,21 @@
+# Secrets
+*.pickle
+client_secret.json
+credentials.json
+.env
+
+# Logs
+logs/
+*.log
+*.err
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
