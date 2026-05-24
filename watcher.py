@@ -1,24 +1,22 @@
 """
 On-Call Dispatch Watcher — Read-only shadowing phase.
-Observes Gmail + Google Chat, logs all traffic to structured JSONL.
-
-Environment variables:
-  GMAIL_QUERY      — Gmail search filter (default: is:unread)
-  TOKEN_FILE       — Path to GWS OAuth token pickle (default: /app/gws-token.pickle)
-  LOG_DIR          — Output directory for log files (default: /app/logs)
-  POLL_INTERVAL    — Seconds between poll cycles (default: 60)
+Observes Gmail + Google Chat, logs all traffic to structured JSON.
+v2: Added full body fetch for first message of each new thread.
 """
 
-import json, os, pickle, time, logging, sys
+import json, os, pickle, time, logging, sys, base64
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-TOKEN_FILE = os.getenv("TOKEN_FILE", "/app/gws-token.pickle")
-LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
-GMAIL_QUERY = os.getenv("GMAIL_QUERY", "is:unread")
+TOKEN_FILE = "/app/gws-token.pickle"
+LOG_DIR = "/app/logs"
+POLL_INTERVAL = 60
+FETCHED_FILE = os.path.join(LOG_DIR, "fetched_threads.json")
+
+GMAIL_QUERY = "to:tce.cc.tickets@tcellc.net"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -45,6 +43,62 @@ err_log = logging.getLogger("error")
 err_log.addHandler(logging.FileHandler(err_path))
 
 
+class BodyExtractor(HTMLParser):
+    """Strip HTML to plaintext for email body extraction."""
+    def __init__(self):
+        super().__init__()
+        self.text = []
+        self.skip = False
+
+    def handle_data(self, data):
+        if not self.skip:
+            cleaned = data.strip()
+            if cleaned:
+                self.text.append(cleaned)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("style", "script"):
+            self.skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("style", "script"):
+            self.skip = False
+
+
+def extract_body_text(payload):
+    """Recursively walk MIME payload to extract plaintext from first text/plain or text/html part."""
+    body = payload.get("body", {})
+    if body.get("data"):
+        data = body["data"]
+        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+        mt = payload.get("mimeType", "")
+        if "text/plain" in mt:
+            return decoded
+        if "text/html" in mt:
+            parser = BodyExtractor()
+            parser.feed(decoded)
+            return "\n".join(parser.text)
+    for part in payload.get("parts", []):
+        result = extract_body_text(part)
+        if result:
+            return result
+    return None
+
+
+def load_fetched_threads():
+    """Load set of thread IDs we've already fetched bodies for."""
+    if os.path.exists(FETCHED_FILE):
+        with open(FETCHED_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_fetched_threads(threads):
+    """Persist fetched thread IDs."""
+    with open(FETCHED_FILE, "w") as f:
+        json.dump(list(threads), f)
+
+
 def get_creds():
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -65,10 +119,51 @@ def sender_display(sender_obj):
         return "unknown"
     uid = sender_obj.get("name", "")
     uid_short = uid.split("/")[-1][:8] if uid else "?"
-    return f"U#{uid_short}"
+    return "U#" + uid_short
 
 
-def poll_gmail(service, last_check):
+def fetch_thread_body(gmail, thread_id):
+    """Fetch the first message in a thread and extract its body text."""
+    try:
+        thread = gmail.users().threads().get(userId="me", id=thread_id).execute()
+        msgs = thread.get("messages", [])
+        if not msgs:
+            return None
+
+        first = gmail.users().messages().get(
+            userId="me", id=msgs[0]["id"], format="full"
+        ).execute()
+
+        headers = {h["name"]: h["value"] for h in first["payload"].get("headers", [])}
+        body_text = extract_body_text(first["payload"])
+
+        entry = {
+            "source": "gmail",
+            "type": "thread_body",
+            "thread_id": thread_id,
+            "first_msg_id": msgs[0]["id"],
+            "total_msgs_in_thread": len(msgs),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "from": headers.get("From", "unknown"),
+            "subject": headers.get("Subject", "no subject"),
+            "date": headers.get("Date", ""),
+            "body": body_text or "",
+        }
+
+        # Append to bodies log
+        bodies_path = os.path.join(LOG_DIR, "gmail_bodies.jsonl")
+        with open(bodies_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        subj_short = headers.get("Subject", "")[:80]
+        logging.info("BODY | Thread %s | %s", thread_id[:12], subj_short)
+        return body_text
+    except Exception as e:
+        err_log.error("Body fetch error for thread %s: %s", thread_id, e)
+        return None
+
+
+def poll_gmail(service, last_check, fetched_threads):
     try:
         results = service.users().messages().list(
             userId="me", q=GMAIL_QUERY, maxResults=10
@@ -85,24 +180,32 @@ def poll_gmail(service, last_check):
             headers = {h["name"]: h["value"] for h in meta.get("payload", {}).get("headers", [])}
             sender = headers.get("From", "unknown")
             subject = headers.get("Subject", "no subject")
+            thread_id = meta.get("threadId", "")
+
             entry = {
                 "source": "gmail",
                 "type": "inbound",
                 "id": msg["id"],
-                "thread_id": meta.get("threadId"),
+                "thread_id": thread_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "from": sender,
                 "subject": subject,
                 "date": headers.get("Date"),
                 "snippet": meta.get("snippet", "")[:200],
             }
-            logging.info(f"GMAIL | {sender} | {subject}")
+            logging.info("GMAIL | %s | %s", sender, subject[:80])
             with open(os.path.join(LOG_DIR, "gmail.jsonl"), "a") as f:
                 f.write(json.dumps(entry) + "\n")
 
+            # Fetch full body for new threads
+            if thread_id and thread_id not in fetched_threads:
+                fetched_threads.add(thread_id)
+                save_fetched_threads(fetched_threads)
+                fetch_thread_body(service, thread_id)
+
         return time.time()
     except Exception as e:
-        err_log.error(f"Gmail poll error: {e}")
+        err_log.error("Gmail poll error: %s", e)
         return last_check
 
 
@@ -135,7 +238,7 @@ def poll_chat(service, spaces, last_messages):
                     "text": text,
                     "has_attachments": len(msg.get("attachments", [])) > 0,
                 }
-                logging.info(f"CHAT | {display} | {sender_name}: {text[:80]}")
+                logging.info("CHAT | %s | %s: %s", display, sender_name, text[:80])
                 with open(os.path.join(LOG_DIR, "chat.jsonl"), "a") as f:
                     f.write(json.dumps(entry) + "\n")
 
@@ -149,16 +252,13 @@ def poll_chat(service, spaces, last_messages):
 
         return last_messages
     except Exception as e:
-        err_log.error(f"Chat poll error: {e}")
+        err_log.error("Chat poll error: %s", e)
         return last_messages
 
 
 def main():
     logging.info("=" * 50)
-    logging.info("ON-CALL DISPATCH WATCHER STARTING (READ-ONLY MODE)")
-    logging.info(f"  Gmail query : {GMAIL_QUERY}")
-    logging.info(f"  Log dir     : {LOG_DIR}")
-    logging.info(f"  Poll every  : {POLL_INTERVAL}s")
+    logging.info("ON-CALL DISPATCH WATCHER STARTING (v2 - with body fetch)")
     logging.info("=" * 50)
 
     creds = get_creds()
@@ -168,20 +268,23 @@ def main():
     spaces = []
     try:
         spaces = chat.spaces().list(pageSize=20).execute().get("spaces", [])
-        logging.info(f"Found {len(spaces)} chat spaces.")
+        logging.info("Found %d chat spaces.", len(spaces))
     except Exception as e:
-        err_log.error(f"Chat space discovery error: {e}")
+        err_log.error("Chat space discovery error: %s", e)
+
+    fetched_threads = load_fetched_threads()
+    logging.info("Already fetched bodies for %d threads.", len(fetched_threads))
 
     last_check = time.time()
     last_messages = {}
-    logging.info(f"Polling every {POLL_INTERVAL}s. Logs -> {LOG_DIR}")
+    logging.info("Polling every %ds. Logs -> %s", POLL_INTERVAL, LOG_DIR)
 
     cycle = 0
     while True:
         cycle += 1
-        last_check = poll_gmail(gmail, last_check)
+        last_check = poll_gmail(gmail, last_check, fetched_threads)
         last_messages = poll_chat(chat, spaces, last_messages)
-        logging.debug(f"Cycle {cycle} complete.")
+        logging.debug("Cycle %d complete.", cycle)
         time.sleep(POLL_INTERVAL)
 
 
@@ -191,5 +294,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Watcher stopped.")
     except Exception as e:
-        err_log.critical(f"Fatal error: {e}", exc_info=True)
+        err_log.critical("Fatal error: %s", e, exc_info=True)
         sys.exit(1)

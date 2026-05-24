@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY watcher.py .
+COPY watcher.py parse_tickets.py ./
 
 RUN mkdir /logs && chown appuser:appuser /logs
 
