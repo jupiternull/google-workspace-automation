@@ -1,0 +1,46 @@
+FROM python:3.13-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git curl jq xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash \
+    && hermes --version \
+    && mv /root/.hermes /opt/hermes \
+    && ln -sf /opt/hermes /root/.hermes
+
+RUN groupadd -r appuser \
+    && useradd -r -g appuser -d /app -s /bin/false -u 10001 appuser
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY watcher.py .
+COPY parse_tickets.py .
+COPY sheets_writer.py .
+RUN mkdir -p /app/chronos
+COPY action_schema.py ./chronos/action_schema.py
+COPY policy.py ./chronos/policy.py
+COPY triggers.py ./chronos/triggers.py
+COPY entrypoint.sh .
+
+RUN mkdir -p /app/logs /app/chronos \
+    && chown -R appuser:appuser /app \
+    && chown -R appuser:appuser /opt/hermes \
+    && chown -R appuser:appuser /usr/local/lib/hermes-agent/venv \
+    && chown -R appuser:appuser /root/.local \
+    && chmod 755 /root
+
+USER appuser
+
+ENV CHRONOS_DRAFT_ONLY=true
+ENV CHRONOS_POLL_INTERVAL=30
+ENV PARSED_TICKETS_PATH=/app/logs/parsed_tickets.jsonl
+ENV CHRONOS_LOG_DIR=/app/chronos
+ENV SHEETS_WRITER_PATH=/app/sheets_writer.py
+ENV PYTHONUNBUFFERED=1
+ENV HERMES_HOME=/opt/hermes
+
+CMD ["bash", "/app/entrypoint.sh"]
