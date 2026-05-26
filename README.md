@@ -54,9 +54,6 @@ Tier 1: Deterministic Pipeline
 The broader system can coordinate multiple generic agents:
 
 ```text
-Agent 1 — route tasks, supervisor
-Agent 2 — research
-Agent 3 — trading
 Workspace Agent — dispatch communications (this repo)
 Orchestrator — coordinates agents
 ```
