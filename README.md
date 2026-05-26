@@ -4,7 +4,8 @@ Agent-assisted dispatch automation for Google Workspace.
 
 ## Overview
 
-Dispatch teams often receive tickets through Gmail, coordinate follow-up in Google Chat, and maintain dispatch status in a spreadsheet. This project keeps the deterministic watcher, parser, and Sheets writer pipeline, then adds an agent layer that reads parsed tickets, produces structured action plans, validates them against deterministic policy, and writes draft communications for review.
+Started this project to make my day job a little easier. Our dispatch team receives outage and maintenance tickets through Gmail, and this automation pipeline coordinates technician comms through Google Chat, maintains dispatch status in Google Sheets, and responds to client emails/dispatches crews to cell site outages. The system preserves a deterministic core built around the watcher, parser, and Sheets writer pipeline, while layering an AI agent orchestration system on top. Parsed tickets are transformed into structured action plans, validated against deterministic policy and workflow rules, then used to generate draft communications, dispatch updates, and operational actions for review and approval. The end-goal here is to build this into a fully autonomous member of the team that learns and grows over time. Shoutout to [Nous Research](https://github.com/nousresearch).
+
 
 The agent is deployed as a Docker container alongside the existing pipeline. It shares the same persistent log volume and Google Workspace OAuth credentials used by the watcher, parser, and Sheets writer.
 
