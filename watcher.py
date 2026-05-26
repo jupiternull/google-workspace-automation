@@ -16,7 +16,7 @@ LOG_DIR = "/app/logs"
 POLL_INTERVAL = 60
 FETCHED_FILE = os.path.join(LOG_DIR, "fetched_threads.json")
 
-GMAIL_QUERY = "to:tce.cc.tickets@tcellc.net"
+GMAIL_QUERY = "to:dispatcher@example.com"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
