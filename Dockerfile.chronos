@@ -35,6 +35,7 @@ RUN mkdir -p /app/logs /app/chronos \
 
 USER appuser
 
+ENV CHRONOS_GMAIL_QUERY="to:change-me@example.com"
 ENV CHRONOS_DRAFT_ONLY=true
 ENV CHRONOS_POLL_INTERVAL=30
 ENV PARSED_TICKETS_PATH=/app/logs/parsed_tickets.jsonl

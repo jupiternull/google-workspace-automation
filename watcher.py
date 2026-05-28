@@ -25,7 +25,7 @@ WOT_RE = re.compile(r"(WOT\d{7})", re.IGNORECASE)
 ETA_RE = re.compile(r"\b(\d+)\s*(min|hour|hr|mins|minutes|hours)\b", re.IGNORECASE)
 TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:am|pm)?\b", re.IGNORECASE)
 
-GMAIL_QUERY = "to:dispatcher@example.com"
+GMAIL_QUERY = os.environ.get("CHRONOS_GMAIL_QUERY", "to:change-me@example.com")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
