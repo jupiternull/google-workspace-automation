@@ -114,43 +114,34 @@ def build_prompt(entry):
     )
     raw_snippet = str(raw_snippet)[:4000]
 
-    prompt = """Read this ticket and produce a structured action plan as JSON.
+    prompt = """Read this ticket and decide what action to take. Output a structured action plan.
 
-Rules:
-- Return ONLY valid JSON, no other text or explanation
-- Do NOT include markdown, code fences, or the schema template
+Return only valid JSON. Do not wrap it in markdown.
 
-Allowed tools (use ONLY these):
-- sheets_writer.log_dispatch — log dispatch (requires wot, site_id)
-- sheets_writer.log_update — update ticket (requires thread_id, status)
-- gmail.draft — draft a reply
-- chat.notify — internal team notification
-- audit.log — log this decision
-
-Reply type must be one of: acknowledgement, missing_info, status_followup
-
-Do NOT invent tools, operations, or reply types not listed above.
-
-Required JSON structure:
+Expected JSON shape:
 {
   "intent": "DISPATCH|ACKNOWLEDGE|REQUEST_INFO|STATUS_FOLLOWUP|ESCALATE",
   "confidence": 0.0,
-  "reasoning": "",
   "ticket_ref": {
     "wot": null,
     "thread_id": null,
     "site_id": null,
     "customer_ticket": null
   },
+  "reasoning": "",
   "actions": [
-    {"tool": "...", "operation": "...", "args": {}}
+    {"tool": "audit", "operation": "log", "args": {"message": ""}}
   ],
   "reply_plan": {
     "requires_reply": false,
     "reply_type": null,
+    "client_visible": false,
+    "auto_send": false,
     "draft_body": null,
     "rationale": ""
-  }
+  },
+  "sender": null,
+  "metadata": {}
 }
 
 Ticket fields:
@@ -175,7 +166,7 @@ Raw email body snippet:
 
 def run_hermes(prompt):
     return subprocess.run(
-        ["hermes", "chat", "-Q", "-q", prompt],
+        ["hermes", "chat", "-q", prompt],
         capture_output=True,
         text=True,
         timeout=120,
@@ -187,30 +178,14 @@ def parse_agent_output(output):
     if not text:
         raise ValueError("empty Hermes output")
 
-    # Find the LAST complete JSON object (scan from end backwards)
-    end_pos = text.rfind("}")
-    if end_pos < 0:
-        raise ValueError("no JSON object found")
-
-    depth = 1
-    i = end_pos - 1
-    while i >= 0 and depth > 0:
-        if text[i] == "}":
-            depth += 1
-        elif text[i] == "{":
-            depth -= 1
-        i -= 1
-
-    if depth != 0:
-        raise ValueError("unmatched braces")
-
-    start = i + 1
     try:
-        return json.loads(text[start:end_pos+1])
+        return json.loads(text)
     except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
         raise
-
-
 
 
 def append_jsonl(path, payload):
@@ -379,11 +354,6 @@ def handle_new_ticket(config, entry):
         plan = parse_agent_output(result.stdout)
     except (ValueError, json.JSONDecodeError) as exc:
         logging.error("unable to parse Hermes output for first_msg_id=%s: %s", first_msg_id, exc)
-        append_audit(config, "unable to parse Hermes output", {
-            "first_msg_id": first_msg_id,
-            "thread_id": entry.get("thread_id"),
-            "error": str(exc),
-        })
         append_jsonl(config["unparseable_path"], {
             "timestamp": utc_now(),
             "first_msg_id": first_msg_id,

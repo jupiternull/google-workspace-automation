@@ -6,7 +6,7 @@ from datetime import datetime
 STATE_PATH = "/app/chronos/actioned_threads.json"
 ALLOWED_SENDERS_PATH = "/app/chronos/allowed_senders.txt"
 
-ALLOWED_SENDER_PATTERNS = ["@clientdomain.com"]
+ALLOWED_SENDER_PATTERNS = ["@tcellc.net"]
 AUTO_SEND_REPLY_TYPES = ["acknowledgement", "missing_info", "status_followup"]
 TOOL_ALLOWLIST = {
     ("sheets_writer", "log_dispatch"),
@@ -462,7 +462,7 @@ def _external_recipient_not_in_original(action, plan):
     original = [_normalize_email(email) for email in original if _normalize_email(email)]
     for recipient in recipients:
         recipient = _normalize_email(recipient)
-        if recipient and not recipient.endswith("@clientdomain.com") and recipient not in original:
+        if recipient and not recipient.endswith("@tcellc.net") and recipient not in original:
             return True
 
     return False

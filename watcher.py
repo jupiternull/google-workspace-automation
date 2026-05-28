@@ -4,17 +4,26 @@ Observes Gmail + Google Chat, logs all traffic to structured JSON.
 v2: Added full body fetch for first message of each new thread.
 """
 
-import json, os, pickle, time, logging, sys, base64
+import json, os, pickle, time, logging, sys, base64, re
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from state_manager import load_active_tickets, save_active_tickets, get_or_create_ticket, update_ticket_stage, find_ticket_by_wot
+from dispatcher import dispatch_to_hermes, write_draft
+from parse_tickets import TicketParser
 
 TOKEN_FILE = "/app/gws-token.pickle"
-LOG_DIR = "/app/logs"
-POLL_INTERVAL = 60
+LOG_DIR = os.environ.get("CHRONOS_LOG_DIR", "/app/logs")
+POLL_INTERVAL = int(os.environ.get("CHRONOS_POLL_INTERVAL", "60"))
 FETCHED_FILE = os.path.join(LOG_DIR, "fetched_threads.json")
+PARSED_TICKETS_FILE = os.environ.get(
+    "PARSED_TICKETS_PATH", os.path.join(LOG_DIR, "parsed_tickets.jsonl")
+)
+WOT_RE = re.compile(r"(WOT\d{7})", re.IGNORECASE)
+ETA_RE = re.compile(r"\b(\d+)\s*(min|hour|hr|mins|minutes|hours)\b", re.IGNORECASE)
+TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:am|pm)?\b", re.IGNORECASE)
 
 GMAIL_QUERY = "to:dispatcher@example.com"
 
@@ -97,6 +106,254 @@ def save_fetched_threads(threads):
     """Persist fetched thread IDs."""
     with open(FETCHED_FILE, "w") as f:
         json.dump(list(threads), f)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_sender_email(sender):
+    match = re.search(r"<([^>]+)>", sender or "")
+    if match:
+        return match.group(1)
+    return sender or ""
+
+
+def append_jsonl(path, entry):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def parsed_record_from_email(entry):
+    parser = TicketParser(
+        os.path.join(LOG_DIR, "gmail_bodies.jsonl"),
+        PARSED_TICKETS_FILE,
+        os.path.join(LOG_DIR, "parsed_ids.json"),
+    )
+    return parser.parse_entry(entry)
+
+
+def ticket_data_from_record(record, sender, subject):
+    coordinates = ""
+    if record.get("location_lat") and record.get("location_lon"):
+        coordinates = "%s, %s" % (record.get("location_lat"), record.get("location_lon"))
+    return {
+        "wot": record.get("wot"),
+        "customer_ticket": record.get("customer_ticket"),
+        "site": record.get("site_id"),
+        "sector": record.get("sector"),
+        "failure": record.get("failure_type"),
+        "technologies": record.get("technologies"),
+        "priority": record.get("priority"),
+        "address": record.get("location_address"),
+        "coordinates": coordinates,
+        "client_email": parse_sender_email(sender),
+        "thread_id": record.get("thread_id"),
+        "first_msg_id": record.get("first_msg_id"),
+        "stage": "dispatched",
+        "email_subject": subject,
+    }
+
+
+def write_ticket_to_sheet(record):
+    try:
+        from sheets_writer import process_once
+
+        append_jsonl(PARSED_TICKETS_FILE, record)
+        process_once()
+    except Exception as e:
+        err_log.error("Sheet write pipeline error for WOT %s: %s", record.get("wot"), e)
+
+
+def draft_client_response(ticket, draft_type, subject, context_text, system_prompt=""):
+    try:
+        body = dispatch_to_hermes(context_text, system_prompt)
+        path = write_draft(
+            ticket.get("wot"),
+            draft_type,
+            ticket.get("client_email"),
+            subject,
+            ticket.get("thread_id"),
+            body,
+        )
+        logging.info("DRAFT | %s | %s | %s", ticket.get("wot"), draft_type, path)
+        tickets = load_active_tickets()
+        wot = ticket.get("wot")
+        if wot in tickets:
+            tickets[wot]["last_client_notification"] = utc_now()
+            tickets[wot]["updated_at"] = utc_now()
+            save_active_tickets(tickets)
+        return path
+    except Exception as e:
+        err_log.error("Draft generation error for WOT %s: %s", ticket.get("wot"), e)
+        return None
+
+
+def process_dispatch_email(sender, subject, thread_id, first_msg_id, body_text, total_msgs):
+    wot = find_ticket_by_wot(subject)
+    if not wot:
+        return
+
+    entry = {
+        "source": "gmail",
+        "type": "thread_body",
+        "thread_id": thread_id,
+        "first_msg_id": first_msg_id,
+        "total_msgs_in_thread": total_msgs,
+        "timestamp": utc_now(),
+        "from": sender,
+        "subject": subject,
+        "date": "",
+        "body": body_text or "",
+    }
+    record = parsed_record_from_email(entry)
+    if not record.get("wot"):
+        record["wot"] = wot
+
+    ticket = get_or_create_ticket(wot, ticket_data_from_record(record, sender, subject))
+    write_ticket_to_sheet(record)
+
+    context = (
+        "Draft type: confirmation\n"
+        "Recipient: %s\nSubject: RE: %s\nTicket: %s\nSite: %s_%s\nFailure: %s\n"
+        "Customer ticket: %s\n\nDispatch email:\n%s"
+        % (
+            ticket.get("client_email"),
+            subject,
+            ticket.get("wot"),
+            ticket.get("site") or "",
+            ticket.get("sector") or "",
+            ticket.get("failure") or "",
+            ticket.get("customer_ticket") or "",
+            body_text or "",
+        )
+    )
+    draft_client_response(ticket, "confirmation", "RE: " + subject, context)
+    logging.info("ON-CALL LOG | Dispatch created for %s from %s", wot, sender)
+
+
+def extract_eta(text):
+    match = ETA_RE.search(text or "")
+    if match:
+        return match.group(0)
+    match = TIME_RE.search(text or "")
+    if match and "eta" in (text or "").lower():
+        return match.group(0)
+    return None
+
+
+def find_ticket_for_chat_message(display, text):
+    wot = find_ticket_by_wot(text)
+    if wot:
+        return wot
+    if not (ETA_RE.search(text or "") or "eta" in (text or "").lower() or TIME_RE.search(text or "")):
+        return None
+    tickets = load_active_tickets()
+    candidates = [
+        ticket.get("wot") for ticket in tickets.values()
+        if ticket.get("chat_space") == display or (not ticket.get("chat_space") and "On Call" in display)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def process_on_call_chat(display, text):
+    if "On Call" not in display:
+        return
+    wot = find_ticket_for_chat_message(display, text)
+    if not wot:
+        return
+
+    tickets = load_active_tickets()
+    if wot not in tickets:
+        return
+
+    lower = (text or "").lower()
+    ticket = tickets[wot]
+    subject = "RE: Work Order Task %s update" % wot
+    updates = {"chat_space": display}
+    draft_type = None
+    new_stage = None
+    prompt = ""
+
+    eta = extract_eta(text)
+    if eta or "eta" in lower:
+        updates["eta"] = eta or text
+        new_stage = "eta_received"
+        draft_type = "eta_update"
+        prompt = "Notify the client that technician ETA is %s." % (updates["eta"])
+    elif "on site" in lower or "onsite" in lower or "arrived" in lower:
+        new_stage = "on_site"
+        draft_type = "on_site_notice"
+        prompt = "Notify the client that the technician is on site."
+    elif "working" in lower or "in progress" in lower or "troubleshooting" in lower:
+        new_stage = "in_progress"
+    elif "done" in lower or "resolved" in lower or "complete" in lower:
+        new_stage = "resolved"
+        draft_type = "resolution"
+        prompt = "Notify the client that the issue is resolved and the site is operational."
+
+    if new_stage:
+        try:
+            ticket = update_ticket_stage(wot, new_stage, updates)
+        except Exception as e:
+            err_log.error("Ticket stage update error for %s: %s", wot, e)
+            return
+        context = (
+            "Draft type: %s\nTicket: %s\nCurrent stage: %s\nETA: %s\n"
+            "Recent chat message from %s:\n%s"
+            % (draft_type, wot, ticket.get("stage"), ticket.get("eta") or "", display, text)
+        )
+        if draft_type:
+            draft_client_response(ticket, draft_type, subject, context, prompt)
+    else:
+        ticket["chat_space"] = display
+        ticket["updated_at"] = utc_now()
+        tickets[wot] = ticket
+        save_active_tickets(tickets)
+
+
+def check_hourly_updates():
+    tickets = load_active_tickets()
+    changed = False
+    now = time.time()
+    for wot, ticket in list(tickets.items()):
+        if ticket.get("stage") not in ("on_site", "in_progress"):
+            continue
+        last_hourly_at = ticket.get("last_hourly_at")
+        due = last_hourly_at is None
+        if last_hourly_at:
+            try:
+                due = now - datetime.fromisoformat(last_hourly_at.replace("Z", "+00:00")).timestamp() > 3600
+            except ValueError:
+                due = True
+        if not due:
+            continue
+
+        created_at = ticket.get("created_at") or utc_now()
+        context = (
+            "Draft type: hourly_update\nTicket: %s\nCurrent stage: %s\n"
+            "Created at: %s\nHourly update count so far: %s\nFailure: %s\n"
+            "Generate a concise hourly client update that work is still active."
+            % (
+                wot,
+                ticket.get("stage"),
+                created_at,
+                ticket.get("hourly_count", 0),
+                ticket.get("failure") or "",
+            )
+        )
+        draft_client_response(ticket, "hourly_update", "RE: Work Order Task %s hourly update" % wot, context)
+        ticket["last_client_notification"] = utc_now()
+        ticket["last_hourly_at"] = utc_now()
+        ticket["hourly_count"] = int(ticket.get("hourly_count") or 0) + 1
+        ticket["updated_at"] = utc_now()
+        tickets[wot] = ticket
+        changed = True
+    if changed:
+        save_active_tickets(tickets)
 
 
 def get_creds():
@@ -201,7 +458,8 @@ def poll_gmail(service, last_check, fetched_threads):
             if thread_id and thread_id not in fetched_threads:
                 fetched_threads.add(thread_id)
                 save_fetched_threads(fetched_threads)
-                fetch_thread_body(service, thread_id)
+                body_text = fetch_thread_body(service, thread_id)
+                process_dispatch_email(sender, subject, thread_id, msg["id"], body_text, 1)
 
         return time.time()
     except Exception as e:
@@ -242,6 +500,8 @@ def poll_chat(service, spaces, last_messages):
                 with open(os.path.join(LOG_DIR, "chat.jsonl"), "a") as f:
                     f.write(json.dumps(entry) + "\n")
 
+                process_on_call_chat(display, text)
+
                 for att in msg.get("attachments", []):
                     if att.get("source", False):
                         file_entry = dict(entry)
@@ -258,7 +518,7 @@ def poll_chat(service, spaces, last_messages):
 
 def main():
     logging.info("=" * 50)
-    logging.info("ON-CALL DISPATCH WATCHER STARTING (v2 - with body fetch)")
+    logging.info("ON-CALL DISPATCH WATCHER STARTING (v3)")
     logging.info("=" * 50)
 
     creds = get_creds()
@@ -284,6 +544,7 @@ def main():
         cycle += 1
         last_check = poll_gmail(gmail, last_check, fetched_threads)
         last_messages = poll_chat(chat, spaces, last_messages)
+        check_hourly_updates()
         logging.debug("Cycle %d complete.", cycle)
         time.sleep(POLL_INTERVAL)
 
